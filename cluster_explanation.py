@@ -9,8 +9,10 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 import openai
+import pydantic
 from pydantic import BaseModel, Field
 from openai import RateLimitError, APIConnectionError, APIError
+from openai import OpenAI
 from tenacity import retry, wait_random_exponential, stop_after_attempt, RetryError
 
 # ----------------------------
@@ -69,15 +71,18 @@ class MessageManager:
     """
     def __init__(
         self,
+        openai_api_key: str,
         messages: Optional[List[Dict[str, str]]] = None,
-        model: str = "gpt-4",
-         openai_api_key: str = "",
+        model: str = "gpt-4o",
     ):
-        self.messages = messages if messages is not None else []
-        self.model = model
         if openai_api_key:
             openai.api_key = openai_api_key
-
+        else:
+           raise ValueError("OpenAI API key is required.")
+        self.client = OpenAI(api_key=openai_api_key)
+        self.messages = messages if messages is not None else []
+        self.model = model
+        
     @retry_decorator
     def _call_openai_api_structured_output(self, **kwargs) -> Dict[str, Any]:
         """
@@ -88,23 +93,17 @@ class MessageManager:
                 f"Calling OpenAI API with model: {self.model}, "
                 f"messages count: {len(self.messages)}, kwargs: {kwargs}"
             )
-            response = openai.ChatCompletion.create(
-                model=self.model,
-                messages=self.messages,
-                **kwargs
-            )
-            logger.debug(f"OpenAI API raw response: {response}")
-
-            choice = response.choices[0]
-            message = choice.message
-            if message.get("content"):
-                logger.info("Received valid completion from OpenAI API.")
-                return {"content": message.content}
-            elif message.get("function_call"):
-                return {"function_call": message.function_call}
-            else:
-                logger.error("Unexpected response structure from OpenAI API.")
-                raise OpenAIAPIError("Unexpected response structure from OpenAI.")
+            completion = self.client.beta.chat.completions.parse(model=self.model, messages=self.messages, **kwargs)
+            logger.debug(f"Response from OpenAI API: {completion}")
+            response = completion.choices[0].message
+            if response.parsed:
+                logger.debug(
+                    "\nthe response was parsed successfully. Data type: {type(response.parsed)}; \nresponse: {response.parsed}"
+                )
+                return response.parsed
+            elif response.refusal:
+                logger.error(f"LLM Refusal: {response.refusal} for request: {kwargs}")
+                raise OpenAIAPIError(f"LLM Refusal: {response.refusal}")
         except (RateLimitError, APIConnectionError, APIError) as e:
             logger.error(f"OpenAI error: {str(e)}")
             raise OpenAIAPIError(f"OpenAI error: {e}") from e
@@ -112,7 +111,8 @@ class MessageManager:
     def get_completion(
         self,
         prompt: str,
-        temperature: float = 0.7,
+        response_format: BaseModel,
+        temperature: float = 0,
         **kwargs: Any,
     ) -> Optional[str]:
         """
@@ -121,20 +121,18 @@ class MessageManager:
         self.messages.append({"role": "user", "content": prompt})
 
         api_kwargs = {"temperature": temperature, **kwargs}
+        if response_format:
+            api_kwargs["response_format"] = response_format
+        else:
+            raise ValueError("response_format is required.")
 
         try:
-            completion_dict = self._call_openai_api_structured_output(**api_kwargs)
-            if not completion_dict:
-                logger.error("Empty completion from OpenAI API.")
+            completion = self._call_openai_api_structured_output(**api_kwargs)
+            if completion is None:
+                logger.error("Received None completion from OpenAI API.")
                 return None
-            content = completion_dict.get("content")
-            if content:
-                # Store the assistant's message
-                self.messages.append({"role": "assistant", "content": content})
-                return content
-            else:
-                logger.error("No content in completion.")
-                return None
+            self.messages.append({"role": "assistant", "content": completion})
+            return completion
         except RetryError as e:
             logger.error(f"Max retries exceeded: {e}")
             raise OpenAIAPIError("Max retries exceeded calling OpenAI.") from e
@@ -195,32 +193,33 @@ class ClusterExplainer:
         )
 
         # Store or build a base prompt template
-        self.prompt_template = (
-            "You are an advanced AI assistant specialized in explaining risk predictions. "
-            "Below is information about a set of clusters derived from text narratives "
-            "of mine injuries, each cluster representing similar 'rationale' patterns "
-            "leading to predictions.\n\n"
-            "We have {num_clusters} clusters total. "
-            "For each cluster, you must provide:\n"
-            "1) cluster_i_name: A short descriptive name.\n"
-            "2) cluster_i_rationale: A general rationale or explanation for the risk patterns in that cluster.\n"
-            "3) cluster_i_tailored_explanation_instructions: Guidance on how to generate a short, customized explanation "
-            "for a specific data point belonging to this cluster (based on that point's narrative and predicted probability).\n\n"
-            "**Your response must be valid JSON** that matches the following structure:\n"
-            "{\n"
-            "  \"clusters\": [\n"
-            "    {\n"
-            "      \"cluster_name\": \"...\",\n"
-            "      \"cluster_rationale\": \"...\",\n"
-            "      \"cluster_tailored_explanation_instructions\": \"...\"\n"
-            "    },\n"
-            "    ... one object per cluster ...\n"
-            "  ]\n"
-            "}\n\n"
-            "Do not output any extra keys or text. The audience are business stakeholders handling claims. "
-            "They need a clear, business-oriented rationale for why these injuries might lead to short or long absences. \n"
-            "Predicted Probability Quantiles:\n{predicted_probability_quantiles}\n"
-        )
+        self.prompt_template = '''You are an advanced AI assistant specialized in explaining risk predictions generated by machine learning models. \
+Your task is to provide explanations for the predicted probabilities outputted by a transformer-based NLP model. \
+The model receives narratives of mine injuries and predicts the probabilities that the injured workers will miss at least 90 days of work. \
+The predictions have been classified into a set of {num_clusters} clusters based on their predicted probabilities and embedding representation of the injury narratives. \
+Your task is to identify the key patterns in the data for each cluster and provide a general explanation for the predicted level of risk of data points in that cluster.
+
+For each cluster, you should provide:
+1) `cluster_i_name`: A short descriptive name.
+2) `cluster_i_rationale`: A general rationale or explanation for the risk patterns in that cluster. \
+The explanation should not explicitly refer to "cluster", but rather use terms such as "this type of injury", so it is accessible to non-technical audience.
+3) `cluster_i_tailored_explanation_instructions`: Guidance on how to generate a short, customized explanation for a specific data point belonging to this cluster \
+(based on that point's narrative and predicted probability). Keep in mind that the customized explanation should avoid unsubstantiated guesses about what drove \
+the model to make the prediction, and instead focus on interpreting the prediction in light of the patterns in the data for the respective cluster.
+
+The audience are business stakeholders handling disability insurance claims, who are seeking to identify early on insurance claims at risk of turning into cases \
+of long-term disability. This could support early intervention that would help workers return to work sooner. The stakeholders need a clear, business-oriented \
+rationale for why these injuries might lead to short or long absences. Note that to be effective, the names and rationales for each cluster should not only \
+represent that data points in each cluster, but should also clearly differentiate the clusters from each other.
+
+As context, here is information about the distribution of the predicted probabilities for the entire dataset:
+{predicted_probability_quantiles}
+
+Below is information about each of the clusters, including:
+- The mean predicted probability
+- 6 prototypical examples, closest to the cluster's centroid
+- 10 random example, representing the variation within the cluster.
+'''
 
     def build_clustering_prompt(self) -> str:
         """
@@ -230,7 +229,7 @@ class ClusterExplainer:
         # Format the header with base info
         prompt_header = self.prompt_template.format(
             num_clusters=self.num_clusters,
-            predicted_probability_quantiles=self.predicted_probability_quantiles
+            predicted_probability_quantiles=self.predicted_probability_quantiles,
         )
 
         # Build cluster details
@@ -257,19 +256,81 @@ class ClusterExplainer:
         and returns a pydantic-validated ResponseSchema object.
         """
         prompt = self.build_clustering_prompt()
-        raw_content = self.msg_manager.get_completion(
-            prompt=prompt, temperature=self.temperature
+        response = self.msg_manager.get_completion(
+            prompt=prompt, 
+            temperature=self.temperature,
+            response_format=self.ResponseSchema
         )
 
-        if not raw_content:
+        if not response:
             logger.error("LLM returned no content.")
             return None
+        
+        return response
+        
+    def display_cluster_explanations(
+        self, 
+        llm_response: Optional[ResponseSchema]
+    ) -> None:
+        """
+        Displays in a readable format each cluster's index, name, mean predicted probability, 
+        and rationale. 
+        """
+        if not llm_response:
+            print("No LLM response available to display.")
+            return
+        
+        if len(llm_response.clusters) != len(self.cluster_data):
+            print("Warning: The number of clusters in LLM response does not match cluster_data. Displaying best effort.\n")
 
-        # Attempt to parse as JSON into our schema
-        try:
-            as_dict = json.loads(raw_content)
-            validated_obj = self.ResponseSchema(**as_dict)
-            return validated_obj
-        except (json.JSONDecodeError, pydantic.ValidationError) as exc:
-            logger.error(f"Failed to parse LLM JSON response: {exc}")
-            return None
+        for idx, cluster_obj in enumerate(llm_response.clusters):
+            # We assume cluster_data is in same order as the LLM response's clusters
+            cinfo = self.cluster_data[idx]
+            cid = cinfo["cluster_id"]
+            mean_prob = cinfo["mean_pred_proba"]
+
+            print(f"\n=== Cluster {cid} ===")
+            print(f"Name: {cluster_obj.cluster_name}")
+            print(f"Mean Probability: {mean_prob:.4f}")
+            print(f"Rationale:\n{cluster_obj.cluster_rationale}")
+
+    def deep_dive_single_cluster(
+        self, 
+        cluster_idx: int,
+        llm_response: Optional[ResponseSchema]
+    ) -> None:
+        """
+        Displays all the input data for a single cluster (from cluster_data)
+        and the corresponding output from the LLM for that cluster.
+        """
+        if not llm_response or cluster_idx >= len(llm_response.clusters):
+            print(f"No LLM response available or invalid cluster_idx: {cluster_idx}")
+            return
+
+        # find cluster data that matches cluster_idx
+        # assume cluster_data is sorted or index-based
+        if cluster_idx >= len(self.cluster_data):
+            print(f"Cluster idx {cluster_idx} is out of range for cluster_data.")
+            return
+
+        cinfo = self.cluster_data[cluster_idx]
+        cluster_llm_obj = llm_response.clusters[cluster_idx]
+
+        # Display input data
+        cid = cinfo["cluster_id"]
+        mean_prob = cinfo["mean_pred_proba"]
+        print(f"\n=== Deep Dive: Cluster {cid} ===")
+        print(f"Mean Probability: {mean_prob:.4f}")
+        print("Top 5 near centroid:")
+        for sample in cinfo["top_centroid_samples"]:
+            print("- ", sample)
+        print("\n10 random picks:")
+        for sample in cinfo["random_samples"]:
+            print("- ", sample)
+
+        # Display LLM output
+        print("\nLLM Output:")
+        print(f" Name: {cluster_llm_obj.cluster_name}")
+        print(f" Rationale: {cluster_llm_obj.cluster_rationale}")
+        print(" Tailored Explanation Instructions:")
+        print(cluster_llm_obj.cluster_tailored_explanation_instructions)
