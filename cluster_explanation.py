@@ -166,7 +166,7 @@ class ClusterExplainer:
         num_clusters: int,
         cluster_data: List[Dict[str, Any]],
         predicted_probability_quantiles: str,
-        model_name: str = "o1",
+        model_name: str = "gpt-4o",
         openai_api_key: str = "",
         temperature: float = 0.3,
     ):

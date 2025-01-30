@@ -130,16 +130,17 @@ class ClusterExplanationPipeline:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         For each sample in dataset, extracts:
-          - The final hidden state (768-dim) from the [CLS] token
-          - The predicted probability (model's classification head)
+        - The final hidden state (768-dim) from the [CLS] token
+        - The predicted probability (model's classification head)
         Returns tuple of (embeddings, probs) arrays
         """
         logger.info("Building embeddings and predicted probabilities...")
         self.model.eval().to(self.device)
 
-        # Create dataloader (keep only tokenized columns)
+        # Create dataloader directly from the tokenized tensors
         dataloader = DataLoader(
-            tokenized_dataset.remove_columns(["label", "__index_level_0__", "text"]),
+            [{k: v[i:i+1] for k, v in tokenized_dataset.items()} 
+            for i in range(len(tokenized_dataset['input_ids']))],
             batch_size=batch_size,
             collate_fn=self.data_collator
         )
@@ -164,9 +165,13 @@ class ClusterExplanationPipeline:
 
         embeddings = np.concatenate(all_embeddings)
         probs = np.concatenate(all_probs)
+        
+        # Store probs as class attribute
+        self.probs = probs
 
         logger.info(f"Built embeddings shape: {embeddings.shape}, probabilities shape: {probs.shape}")
         return embeddings, probs
+
 
     def optional_pca_transform(self, embeddings: np.ndarray) -> np.ndarray:
         """
@@ -407,7 +412,7 @@ class ClusterExplanationPipeline:
         from cluster_explanation import ClusterExplainer
         
         # Compute probability distribution description
-        prob_quantiles = self.compute_probability_quantiles(self.all_probs)
+        prob_quantiles = self.compute_probability_quantiles(self.probs)
         
         logger.info("Generating cluster explanations using LLM...")
         explainer = ClusterExplainer(
@@ -444,7 +449,7 @@ class ClusterExplanationPipeline:
         embeddings, probs = self.build_embeddings_and_probs(tokenized_dataset)
         
         # Store all probs for later quantile computation
-        self.all_probs = probs
+        self.probs = probs
         
         # First apply PCA to get variances for alpha computation
         if self.use_pca:
